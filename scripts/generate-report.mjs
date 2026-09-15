@@ -216,27 +216,28 @@ const reportHtml = ({ results, updatedAt }) => {
   .hl { display:grid; gap:.5rem; margin-bottom:1.25rem; font-size:.92rem; }
   .label, dt, .field-row span:first-child { color:var(--muted); }
   .up { color:var(--up); } .down { color:var(--down); }
-  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:.85rem; }
-  .card { display:flex; flex-direction:column; gap:.55rem; padding:.95rem 1rem; background:var(--card); border:1px solid var(--border); border-radius:14px; }
-  .card header { display:flex; justify-content:space-between; align-items:flex-start; gap:.75rem; }
-  .card h2 { margin:0; font-size:1.1rem; letter-spacing:.02em; }
-  .name { max-width:190px; overflow:hidden; color:var(--muted); font-size:.75rem; text-overflow:ellipsis; white-space:nowrap; }
-  .session { color:var(--muted); font-size:.75rem; text-align:right; text-transform:uppercase; letter-spacing:.04em; }
+  .grid { display:grid; grid-template-columns:1fr; gap:1.25rem; }
+  .card { min-width:0; display:flex; flex-direction:column; gap:.9rem; padding:1.75rem 1.5rem; background:var(--card); border:1px solid var(--border); border-radius:18px; }
+  .card header { display:flex; justify-content:space-between; align-items:flex-start; gap:1rem; }
+  .card h2 { margin:0; font-size:1.6rem; letter-spacing:.02em; }
+  .name { max-width:240px; overflow:hidden; color:var(--muted); font-size:1rem; text-overflow:ellipsis; white-space:nowrap; }
+  .session { color:var(--muted); font-size:.95rem; text-align:right; text-transform:uppercase; letter-spacing:.04em; }
   .price-row { display:flex; justify-content:space-between; align-items:baseline; }
-  .price { font-size:1.35rem; font-weight:650; font-variant-numeric:tabular-nums; }
-  .chg { font-weight:600; font-variant-numeric:tabular-nums; }
+  .price { font-size:2.2rem; font-weight:650; font-variant-numeric:tabular-nums; }
+  .chg { font-size:1.25rem; font-weight:600; font-variant-numeric:tabular-nums; }
   .flat { color:var(--muted); }
-  .sparkline-wrap { padding:.25rem 0 .1rem; border-top:1px solid var(--border); border-bottom:1px solid var(--border); }
-  .sparkline { display:block; width:100%; height:62px; }
-  .sparkline-values { overflow:hidden; color:var(--muted); font-size:.68rem; text-overflow:ellipsis; white-space:nowrap; }
-  .sparkline-empty { height:62px; color:var(--muted); font-size:1.5rem; text-align:center; line-height:62px; }
-  .meta { display:grid; grid-template-columns:repeat(2,1fr); gap:.45rem .7rem; margin:0; font-size:.78rem; }
+  .sparkline-wrap { padding:.45rem 0 .25rem; border-top:1px solid var(--border); border-bottom:1px solid var(--border); }
+  .sparkline { display:block; width:100%; height:120px; }
+  .sparkline-values { overflow:hidden; color:var(--muted); font-size:.9rem; text-overflow:ellipsis; white-space:nowrap; }
+  .sparkline-empty { height:120px; color:var(--muted); font-size:2rem; text-align:center; line-height:120px; }
+  .meta { display:grid; grid-template-columns:repeat(2,1fr); gap:.75rem 1rem; min-width:0; margin:0; font-size:1rem; }
+  .meta > div { min-width:0; }
   dt { font-weight:500; } dd { margin:.1rem 0 0; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
-  .news { margin-top:.1rem; padding-top:.55rem; border-top:1px solid var(--border); font-size:.8rem; }
-  .news-label { margin-bottom:.2rem; color:var(--muted); font-size:.68rem; text-transform:uppercase; letter-spacing:.04em; }
+  .news { margin-top:.1rem; padding-top:.8rem; border-top:1px solid var(--border); font-size:1rem; }
+  .news-label { margin-bottom:.3rem; color:var(--muted); font-size:.85rem; text-transform:uppercase; letter-spacing:.04em; }
   .news a { color:var(--accent); text-decoration:none; } .news a:hover { text-decoration:underline; }
-  .error-card { border-color:var(--down); } .error-message { color:var(--down); font-size:.85rem; overflow-wrap:anywhere; }
-  footer { margin-top:1.5rem; color:var(--muted); font-size:.8rem; }
+  .error-card { border-color:var(--down); } .error-message { color:var(--down); font-size:1.05rem; overflow-wrap:anywhere; }
+  footer { margin-top:2rem; color:var(--muted); font-size:1rem; }
 </style>
 </head>
 <body>
@@ -295,8 +296,8 @@ const renderReportPng = async (htmlPath, pngPath) => {
   });
   try {
     const page = await browser.newPage();
-    // Phone-readable width with 2-column grid; fullPage captures full height.
-    await page.setViewport({ width: 900, height: 1400, deviceScaleFactor: 2 });
+    // Phone-readable width with one tile per row; fullPage captures full height.
+    await page.setViewport({ width: 450, height: 1200, deviceScaleFactor: 2 });
     await page.goto(pathToFileURL(htmlPath).href, {
       waitUntil: "networkidle0",
       timeout: 60_000,
