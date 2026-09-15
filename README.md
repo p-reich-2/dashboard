@@ -52,7 +52,7 @@ export const TICKERS: string[] = [
 
 Restart the dev server (or rebuild) after changing the list.
 
-## Morning report (HTML + PNG)
+## Morning report (HTML + multi-page PNG)
 
 With the Next.js API running on `localhost:3000`:
 
@@ -64,13 +64,14 @@ This writes:
 
 | Artifact | Path (default) | Use |
 |---|---|---|
-| **PNG (primary)** | `/workspace/stock-report-sample.png` | **Attach this in morning routines** — phone-readable full-page screenshot of the dark-theme tiles |
-| HTML (secondary) | `/workspace/stock-report-sample.html` | Optional desktop / archive copy |
+| **PNG pages (primary)** | `/workspace/stock-report-sample-1.png`, `-2.png`, … | **Attach these in morning routines** — phone-aspect pages (~2 tiles each), large type |
+| Page manifest | `/workspace/stock-report-sample-pages.txt` | List of PNG page paths |
+| HTML (secondary) | `/workspace/stock-report-sample.html` | Optional desktop / archive copy (full watchlist) |
 | Text summary | `/workspace/stock-report-sample-summary.txt` | Quick glance |
 
-PNG is rendered with **puppeteer-core** against system Chrome (`/usr/bin/google-chrome-stable`, override with `CHROME_PATH`). Viewport is ~900px wide at 2× DPR with `fullPage: true` so sparklines and tiles stay readable on phone.
+PNGs are rendered with **puppeteer-core** against system Chrome (`/usr/bin/google-chrome-stable`, override with `CHROME_PATH`). Viewport is **~414 CSS px** wide at **3×** DPR. Each page holds about **2 tiles** (stacked), so chat apps do not shrink an ultra-tall image. Dated reports use the same pattern: `basename-1.png`, `basename-2.png`, …
 
-**Morning routine guidance:** attach the **PNG** as the primary report Paul opens on phone. Include the HTML only as an optional secondary attachment for desktop.
+**Morning routine guidance:** attach the **numbered PNG pages** as the primary report Paul opens on phone. Do **not** send one giant full-watchlist PNG. Include the HTML only as an optional secondary attachment for desktop.
 
 ## How data is fetched
 
