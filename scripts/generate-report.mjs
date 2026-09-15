@@ -2,11 +2,17 @@
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
+import puppeteer from "puppeteer-core";
 
 const DEFAULT_OUTPUT = "/workspace/stock-report-sample.html";
 const API_BASE = process.env.STOCK_API_BASE ?? "http://localhost:3000/api/stocks";
 const TICKERS_FILE = new URL("../src/config/tickers.ts", import.meta.url);
 const PACIFIC_TIME_ZONE = "America/Los_Angeles";
+const CHROME_PATH =
+  process.env.CHROME_PATH ??
+  process.env.PUPPETEER_EXECUTABLE_PATH ??
+  "/usr/bin/google-chrome-stable";
 
 const htmlEscape = (value) => String(value)
   .replaceAll("&", "&amp;")
@@ -145,9 +151,8 @@ const sparklineMarkup = (data, symbol) => {
 };
 
 const newsMarkup = (data) => {
-  if (!data.newsTitle) return `<div class="news">—</div>`;
-  if (!data.newsUrl) return `<div class="news">${htmlEscape(data.newsTitle)}</div>`;
-  return `<div class="news"><a href="${htmlEscape(data.newsUrl)}" target="_blank" rel="noopener">${htmlEscape(data.newsTitle)}</a></div>`;
+  if (!data.newsTitle || !data.newsUrl) return "";
+  return `<div class="news"><div class="news-label">Latest news</div><a href="${htmlEscape(data.newsUrl)}" target="_blank" rel="noopener">${htmlEscape(data.newsTitle)}</a></div>`;
 };
 
 const cardMarkup = ({ symbol, data, error }) => {
@@ -183,7 +188,6 @@ const cardMarkup = ({ symbol, data, error }) => {
       ${detailFields.map(([key, value]) => `<div><dt>${htmlEscape(labelFor(key))}</dt><dd>${htmlEscape(displayValue(key, value))}</dd></div>`).join("\n      ")}
     </dl>
     ${newsMarkup(data)}
-    <div class="field-row"><span>${htmlEscape(labelFor("newsUrl"))}</span><span>${data.newsUrl ? "available" : "—"}</span></div>
   </article>`;
 };
 
@@ -228,9 +232,9 @@ const reportHtml = ({ results, updatedAt }) => {
   .sparkline-empty { height:62px; color:var(--muted); font-size:1.5rem; text-align:center; line-height:62px; }
   .meta { display:grid; grid-template-columns:repeat(2,1fr); gap:.45rem .7rem; margin:0; font-size:.78rem; }
   dt { font-weight:500; } dd { margin:.1rem 0 0; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
-  .news { min-height:2.4em; margin-top:.1rem; padding-top:.55rem; border-top:1px solid var(--border); color:var(--muted); font-size:.8rem; }
+  .news { margin-top:.1rem; padding-top:.55rem; border-top:1px solid var(--border); font-size:.8rem; }
+  .news-label { margin-bottom:.2rem; color:var(--muted); font-size:.68rem; text-transform:uppercase; letter-spacing:.04em; }
   .news a { color:var(--accent); text-decoration:none; } .news a:hover { text-decoration:underline; }
-  .field-row { display:flex; justify-content:space-between; gap:.75rem; color:var(--muted); font-size:.72rem; }
   .error-card { border-color:var(--down); } .error-message { color:var(--down); font-size:.85rem; overflow-wrap:anywhere; }
   footer { margin-top:1.5rem; color:var(--muted); font-size:.8rem; }
 </style>
@@ -259,6 +263,7 @@ const reportSummary = ({ results, updatedAt }) => {
     .filter(({ change }) => Number.isFinite(change));
   const gainers = [...changes].sort((a, b) => b.change - a.change).slice(0, 3);
   const losers = [...changes].sort((a, b) => a.change - b.change).slice(0, 3);
+  const withNews = successful.filter(({ data }) => data.newsTitle && data.newsUrl);
   const lines = [
     `Updated ${formatPacific(updatedAt)} (Pacific)`,
     "",
@@ -269,29 +274,69 @@ const reportSummary = ({ results, updatedAt }) => {
     "",
     ...results.map(({ symbol, data, error }) => error
       ? `${symbol} [FAILED: ${error}]`
-      : `${symbol} ${formatPrice(data.price)} (${formatChange(data.changePercent)}) [${displayValue("priceLabel", data.priceLabel)}]`),
+      : `${symbol} ${formatPrice(data.price)} (${formatChange(data.changePercent)}) [${displayValue("priceLabel", data.priceLabel)}]${data.newsTitle ? ` | news: ${data.newsTitle}` : " | news: —"}`),
     "",
-    `${successful.length} tickers loaded; ${failed.length} failed.`,
+    `${successful.length} tickers loaded; ${failed.length} failed; ${withNews.length} with company-specific news (48h).`,
   ];
   return `${lines.join("\n")}\n`;
 };
 
+/** Full-page PNG via headless Chrome (puppeteer-core + system Chrome). */
+const renderReportPng = async (htmlPath, pngPath) => {
+  const browser = await puppeteer.launch({
+    executablePath: CHROME_PATH,
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--font-render-hinting=none",
+    ],
+  });
+  try {
+    const page = await browser.newPage();
+    // Phone-readable width with 2-column grid; fullPage captures full height.
+    await page.setViewport({ width: 900, height: 1400, deviceScaleFactor: 2 });
+    await page.goto(pathToFileURL(htmlPath).href, {
+      waitUntil: "networkidle0",
+      timeout: 60_000,
+    });
+    await page.screenshot({
+      path: pngPath,
+      type: "png",
+      fullPage: true,
+    });
+  } finally {
+    await browser.close();
+  }
+};
+
 const main = async () => {
   const outputPath = path.resolve(process.argv[2] || DEFAULT_OUTPUT);
-  const summaryPath = path.join(path.dirname(outputPath), `${path.basename(outputPath, path.extname(outputPath))}-summary.txt`);
+  const baseName = path.basename(outputPath, path.extname(outputPath));
+  const outDir = path.dirname(outputPath);
+  const summaryPath = path.join(outDir, `${baseName}-summary.txt`);
+  const pngPath = path.join(outDir, `${baseName}.png`);
   const tickers = await getTickers();
   const updatedAt = new Date();
   const results = await fetchAll(tickers);
-  await mkdir(path.dirname(outputPath), { recursive: true });
+  await mkdir(outDir, { recursive: true });
   await Promise.all([
     writeFile(outputPath, reportHtml({ results, updatedAt }), "utf8"),
     writeFile(summaryPath, reportSummary({ results, updatedAt }), "utf8"),
   ]);
 
+  await renderReportPng(outputPath, pngPath);
+
   const failures = results.filter((result) => result.error);
+  const withNews = results.filter((r) => !r.error && r.data?.newsTitle && r.data?.newsUrl);
+  const withoutNews = results.filter((r) => !r.error && !(r.data?.newsTitle && r.data?.newsUrl));
   console.log(`Wrote ${outputPath}`);
   console.log(`Wrote ${summaryPath}`);
+  console.log(`Wrote ${pngPath}`);
   console.log(`Loaded ${results.length - failures.length}/${results.length} tickers; ${failures.length} failed.`);
+  console.log(`News: ${withNews.map((r) => r.symbol).join(", ") || "(none)"}`);
+  console.log(`No news: ${withoutNews.map((r) => r.symbol).join(", ") || "(none)"}`);
   for (const failure of failures) console.error(`${failure.symbol}: ${failure.error}`);
   if (failures.length) process.exitCode = 1;
 };

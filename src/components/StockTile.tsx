@@ -67,6 +67,7 @@ export function StockTile({ symbol, data, loading, error }: StockTileProps) {
 
   const up = (data.changePercent ?? 0) >= 0;
   const changeColor = up ? "text-emerald-400" : "text-red-400";
+  const hasNews = Boolean(data.newsTitle && data.newsUrl);
 
   return (
     <article className="rounded-2xl border border-zinc-800 bg-zinc-900/90 p-4 shadow-lg shadow-black/20 flex flex-col gap-3 min-h-[220px] hover:border-zinc-700 transition-colors">
@@ -123,23 +124,21 @@ export function StockTile({ symbol, data, loading, error }: StockTileProps) {
         <Sparkline data={data.sparkline} positive={up} />
       </div>
 
-      <div className="border-t border-zinc-800 pt-2">
-        <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-1">
-          Latest news
-        </div>
-        {data.newsTitle && data.newsUrl ? (
+      {hasNews && (
+        <div className="border-t border-zinc-800 pt-2">
+          <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-1">
+            Latest news
+          </div>
           <a
-            href={data.newsUrl}
+            href={data.newsUrl!}
             target="_blank"
             rel="noopener noreferrer"
             className="text-xs text-sky-400 hover:text-sky-300 line-clamp-2 leading-snug"
           >
             {data.newsTitle}
           </a>
-        ) : (
-          <span className="text-xs text-zinc-500">—</span>
-        )}
-      </div>
+        </div>
+      )}
     </article>
   );
 }

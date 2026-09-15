@@ -7,6 +7,34 @@ const execFileAsync = promisify(execFile);
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+const NEWS_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+const NEWS_FETCH_COUNT = 12;
+
+/** Extra title aliases when Yahoo shortName alone is too narrow or awkward. */
+const TICKER_ALIASES: Record<string, string[]> = {
+  GOOGL: ["Google", "Alphabet"],
+  GOOG: ["Google", "Alphabet"],
+  META: ["Facebook", "Meta Platforms"],
+  BRK: ["Berkshire"],
+  "BRK-B": ["Berkshire"],
+  "BRK-A": ["Berkshire"],
+  TSLA: ["Tesla"],
+  MSFT: ["Microsoft"],
+  AMZN: ["Amazon"],
+  NVDA: ["Nvidia", "NVIDIA"],
+  AMD: ["Advanced Micro Devices"],
+  PLTR: ["Palantir"],
+  IBIT: ["iShares Bitcoin Trust", "Bitcoin Trust"],
+  CELH: ["Celsius"],
+  CRSP: ["CRISPR", "CRISPR Therapeutics"],
+  LMND: ["Lemonade"],
+  IONQ: ["IonQ"],
+  RDW: ["Redwire"],
+  HII: ["Huntington Ingalls"],
+  NOW: ["ServiceNow"],
+  BMNR: ["BitMine"],
+};
+
 async function yahooJson(url: string): Promise<unknown> {
   const res = await fetch(url, {
     headers: {
@@ -167,32 +195,163 @@ async function fetchChart(symbol: string): Promise<{
   return { meta: result.meta, sparkline: closes.slice(-5) };
 }
 
-async function fetchNews(
-  symbol: string
-): Promise<{ title: string | null; url: string | null }> {
+interface YahooNewsItem {
+  title?: string;
+  link?: string;
+  publisher?: string;
+  providerPublishTime?: number;
+  relatedTickers?: string[];
+  summary?: string;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Strip legal suffixes so "Tesla, Inc." → "Tesla" for title matching. */
+function companyNamePhrases(name: string | null | undefined): string[] {
+  if (!name) return [];
+  const cleaned = name
+    .replace(
+      /,?\s+(Inc\.?|Incorporated|Corp\.?|Corporation|Ltd\.?|Limited|Co\.?|Company|Holdings|Holding|Group|PLC|N\.V\.|S\.A\.|Class\s+[A-Z]|Ordinary Shares|Common Stock)\b\.?/gi,
+      ""
+    )
+    .replace(/\.com\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (cleaned.length < 2) return [];
+  const phrases = [cleaned];
+  const parts = cleaned.split(/\s+/).filter(Boolean);
+  if (parts.length > 1 && parts[0].length >= 4) {
+    phrases.push(parts[0]);
+  }
+  return phrases;
+}
+
+function newsMatchTerms(
+  symbol: string,
+  companyName: string | null | undefined
+): string[] {
+  const terms = new Set<string>();
+  terms.add(symbol);
+  for (const phrase of companyNamePhrases(companyName)) {
+    terms.add(phrase);
+  }
+  for (const alias of TICKER_ALIASES[symbol] ?? []) {
+    terms.add(alias);
+  }
+  // Drop ultra-short / generic tokens that would match unrelated headlines.
+  return Array.from(terms).filter((t) => t.length >= 2);
+}
+
+/** Tickers that are common English words — bare word-boundary ticker matches are too noisy. */
+const AMBIGUOUS_TICKERS = new Set([
+  "NOW",
+  "ALL",
+  "ONE",
+  "ARE",
+  "OUT",
+  "FOR",
+  "NEW",
+  "LOW",
+  "HAS",
+  "ANY",
+  "BIG",
+  "SEE",
+]);
+
+function textMentionsCompany(
+  text: string,
+  symbol: string,
+  companyName: string | null | undefined
+): boolean {
+  if (!text.trim()) return false;
+  for (const term of newsMatchTerms(symbol, companyName)) {
+    if (term.toUpperCase() === symbol && AMBIGUOUS_TICKERS.has(symbol)) {
+      // Require $NOW, (NOW), or "NOW stock/shares" — not bare English "now".
+      const strict = new RegExp(
+        `(?:\\$${escapeRegExp(symbol)}\\b|\\(${escapeRegExp(symbol)}\\)|\\b${escapeRegExp(symbol)}\\s+(?:stock|shares|equity)\\b)`,
+        "i"
+      );
+      if (strict.test(text)) return true;
+      continue;
+    }
+    const pattern =
+      term.toUpperCase() === symbol
+        ? `(?:\\$)?\\b${escapeRegExp(term)}\\b`
+        : `\\b${escapeRegExp(term)}\\b`;
+    if (new RegExp(pattern, "i").test(text)) return true;
+  }
+  return false;
+}
+
+function isRecentNews(item: YahooNewsItem, nowMs: number): boolean {
+  const published = item.providerPublishTime;
+  if (typeof published !== "number" || !Number.isFinite(published)) return false;
+  // Yahoo search uses unix seconds; tolerate ms if ever seen.
+  const publishedMs = published > 1e12 ? published : published * 1000;
+  const age = nowMs - publishedMs;
+  return age >= 0 && age <= NEWS_MAX_AGE_MS;
+}
+
+/** Market digests / wraps that casually list many tickers — skip even if name appears. */
+const GENERIC_HEADLINE_RE =
+  /\b(stock market today|markets?\s+(today|live|wrap|recap|update|open)|live coverage|what to watch|stocks?\s+to\s+watch|midday\s+movers|top\s+(stock\s+)?(gainers|losers|movers)|wall st(?:reet)?\s+set to|most active stocks|bc-most active)\b/i;
+
+function isGenericMarketHeadline(title: string): boolean {
+  return GENERIC_HEADLINE_RE.test(title);
+}
+
+/** "NOW, INTU, ADBE, CRM Stocks Surge..." style multi-name list leads. */
+function isMultiTickerListHeadline(title: string): boolean {
+  return /^[A-Z]{1,5}(?:\s*,\s*[A-Z]{1,5}){2,}\b/.test(title.trim());
+}
+
+function isAboutCompany(
+  item: YahooNewsItem,
+  symbol: string,
+  companyName: string | null | undefined
+): boolean {
+  const title = item.title ?? "";
+  const summary = item.summary ?? "";
+  if (isGenericMarketHeadline(title) || isMultiTickerListHeadline(title)) return false;
+  // Strict: title or summary must name the company/ticker. relatedTickers alone is not enough.
+  return (
+    textMentionsCompany(title, symbol, companyName) ||
+    textMentionsCompany(summary, symbol, companyName)
+  );
+}
+
+async function fetchNewsCandidates(symbol: string): Promise<YahooNewsItem[]> {
   const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(
     symbol
-  )}&newsCount=5&quotesCount=0`;
-  try {
-    const json = (await yahooJson(url)) as {
-      news?: Array<{
-        title?: string;
-        link?: string;
-        relatedTickers?: string[];
-      }>;
-    };
-    const news = json.news ?? [];
-    const related =
-      news.find((n) =>
-        (n.relatedTickers ?? []).some((t) => t.toUpperCase() === symbol)
-      ) ?? news[0];
-    return {
-      title: related?.title ?? null,
-      url: related?.link ?? null,
-    };
-  } catch {
-    return { title: null, url: null };
+  )}&newsCount=${NEWS_FETCH_COUNT}&quotesCount=0`;
+  const json = (await yahooJson(url)) as { news?: YahooNewsItem[] };
+  return json.news ?? [];
+}
+
+function pickRelevantNews(
+  candidates: YahooNewsItem[],
+  symbol: string,
+  companyName: string | null | undefined
+): { title: string | null; url: string | null } {
+  const nowMs = Date.now();
+  const recent = candidates.filter((n) => isRecentNews(n, nowMs));
+  const relevant = recent.filter((n) => isAboutCompany(n, symbol, companyName));
+
+  const picked = relevant.find((n) => n.title && n.link) ?? null;
+
+  if (picked) {
+    console.log(
+      `[news] ${symbol}: kept "${picked.title}" (${relevant.length}/${candidates.length} candidates passed filters)`
+    );
+    return { title: picked.title ?? null, url: picked.link ?? null };
   }
+
+  console.log(
+    `[news] ${symbol}: none (candidates=${candidates.length}, recent48h=${recent.length}, aboutCompany=0)`
+  );
+  return { title: null, url: null };
 }
 
 async function fetchFundamentals(symbol: string): Promise<{
@@ -286,7 +445,7 @@ export async function fetchStockData(symbol: string): Promise<StockData> {
 
   const [chartSettled, newsSettled, fundSettled] = await Promise.allSettled([
     fetchChart(sym),
-    fetchNews(sym),
+    fetchNewsCandidates(sym),
     withFundSlot(() => fetchFundamentals(sym)),
   ]);
 
@@ -300,10 +459,11 @@ export async function fetchStockData(symbol: string): Promise<StockData> {
 
   const { meta, sparkline } = chartSettled.value;
   const { price, label } = pickPrice(meta);
+  const companyName = meta.shortName || meta.longName || null;
 
   const news =
     newsSettled.status === "fulfilled"
-      ? newsSettled.value
+      ? pickRelevantNews(newsSettled.value, sym, companyName)
       : { title: null, url: null };
   const funds =
     fundSettled.status === "fulfilled"
@@ -316,7 +476,7 @@ export async function fetchStockData(symbol: string): Promise<StockData> {
 
   return {
     symbol: sym,
-    name: meta.shortName || meta.longName || null,
+    name: companyName,
     price,
     priceLabel: label,
     changePercent: num(meta.regularMarketChangePercent),
