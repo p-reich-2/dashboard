@@ -1,0 +1,43 @@
+/** Watchlist symbols (Yahoo Finance tickers). */
+export const TICKERS = [
+  "TSLA",
+  "IBIT",
+  "BMNR",
+  "GOOGL",
+  "MSFT",
+  "AMZN",
+  "PLTR",
+  "NVDA",
+  "AMD",
+  "NOW",
+  "IONQ",
+  "CELH",
+  "XOVR",
+  "SPCX",
+  "RDW",
+  "LMND",
+  "CRSP",
+  "HII",
+];
+
+/** Extra title aliases when Yahoo shortName alone is too narrow. */
+export const TICKER_ALIASES = {
+  GOOGL: ["Google", "Alphabet"],
+  GOOG: ["Google", "Alphabet"],
+  META: ["Facebook", "Meta Platforms"],
+  TSLA: ["Tesla"],
+  MSFT: ["Microsoft"],
+  AMZN: ["Amazon"],
+  NVDA: ["Nvidia", "NVIDIA"],
+  AMD: ["Advanced Micro Devices"],
+  PLTR: ["Palantir"],
+  IBIT: ["iShares Bitcoin Trust", "Bitcoin Trust"],
+  CELH: ["Celsius"],
+  CRSP: ["CRISPR", "CRISPR Therapeutics"],
+  LMND: ["Lemonade"],
+  IONQ: ["IonQ"],
+  RDW: ["Redwire"],
+  HII: ["Huntington Ingalls"],
+  NOW: ["ServiceNow"],
+  BMNR: ["BitMine"],
+};
