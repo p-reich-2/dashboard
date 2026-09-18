@@ -393,22 +393,243 @@ function pickRelevantNews(candidates, symbol, companyName) {
   return { title: null, url: null };
 }
 
+/**
+ * Fetch Yahoo HTML via jina (X-Respond-With: html) + CORS proxies.
+ * quoteSummary JSON API returns Invalid Crumb in the browser; scrape instead.
+ * @param {string} yahooUrl
+ * @param {{ attempts?: number }} [opts]
+ * @returns {Promise<string>}
+ */
+async function fetchYahooHtml(yahooUrl, opts = {}) {
+  const attempts = opts.attempts ?? MAX_ATTEMPTS;
+  const enc = encodeURIComponent(yahooUrl);
+  /** @type {{ url: string, headers?: Record<string, string> }[]} */
+  const candidates = [
+    {
+      url: `https://r.jina.ai/${yahooUrl}`,
+      headers: {
+        Accept: "text/html,text/plain,*/*",
+        "X-Respond-With": "html",
+      },
+    },
+    {
+      url: `https://api.allorigins.win/raw?url=${enc}`,
+      headers: { Accept: "text/html,*/*" },
+    },
+    {
+      url: `https://api.allorigins.win/get?url=${enc}`,
+      headers: { Accept: "application/json" },
+    },
+    {
+      url: yahooUrl,
+      headers: { Accept: "text/html" },
+    },
+    // Markdown reader — last resort for visible fields like 1y Target Est
+    {
+      url: `https://r.jina.ai/${yahooUrl}`,
+      headers: { Accept: "text/plain,*/*" },
+    },
+  ];
+  const errors = [];
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const order = candidates
+      .slice(attempt % candidates.length)
+      .concat(candidates.slice(0, attempt % candidates.length));
+
+    for (const cand of order) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+      try {
+        const res = await fetch(cand.url, {
+          cache: "no-store",
+          signal: controller.signal,
+          headers: cand.headers,
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        let text = await res.text();
+        if (!text || !text.trim()) throw new Error("Empty body");
+
+        // Unwrap allorigins /get JSON envelope
+        const trimmed = text.trim();
+        if (trimmed.startsWith("{")) {
+          try {
+            const parsed = JSON.parse(trimmed);
+            if (parsed && typeof parsed.contents === "string") {
+              text = parsed.contents;
+            } else if (
+              parsed?.data &&
+              typeof parsed.data.content === "string"
+            ) {
+              text = parsed.data.content;
+            }
+          } catch {
+            // keep raw text
+          }
+        }
+        if (!text || text.trim().length < 200) throw new Error("HTML too short");
+        return text;
+      } catch (err) {
+        const msg =
+          err?.name === "AbortError"
+            ? "timeout"
+            : err instanceof Error
+              ? err.message
+              : String(err);
+        const host = (() => {
+          try {
+            return new URL(cand.url).hostname;
+          } catch {
+            return "fetch";
+          }
+        })();
+        errors.push(`${host}: ${msg}`);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    if (attempt < attempts - 1) {
+      await sleep(RETRY_BASE_MS * Math.pow(2, attempt) + Math.random() * 400);
+    }
+  }
+  throw new Error(errors.slice(-4).join(" · ") || "HTML fetch failed");
+}
+
+/**
+ * Parse forwardPE / recommendation / target from Yahoo quote or analysis HTML
+ * (embedded quoteSummary JSON, escaped JSON blobs, or visible labels).
+ * @param {string} html
+ */
+function parseFundamentalsFromHtml(html) {
+  const empty = { forwardPE: null, recommendation: null, targetPrice: null };
+  if (!html || html.length < 500) return empty;
+
+  // 1) SvelteKit fetched quoteSummary script (same as src/lib/yahoo.ts)
+  try {
+    let m = html.match(
+      /<script type="application\/json" data-sveltekit-fetched data-url="https:\/\/query1\.finance\.yahoo\.com\/v10\/finance\/quoteSummary\/[^"]*"[^>]*>([\s\S]*?)<\/script>/i
+    );
+    if (m) {
+      const wrapper = JSON.parse(m[1]);
+      let body = wrapper.body;
+      if (typeof body === "string") body = JSON.parse(body);
+      const result = body?.quoteSummary?.result?.[0];
+      if (result) {
+        const out = {
+          forwardPE: num(result.defaultKeyStatistics?.forwardPE),
+          recommendation: formatRecommendation(
+            result.financialData?.recommendationKey ?? null
+          ),
+          targetPrice: num(result.financialData?.targetMeanPrice),
+        };
+        if (
+          out.forwardPE != null ||
+          out.recommendation ||
+          out.targetPrice != null
+        ) {
+          return out;
+        }
+      }
+    }
+  } catch {
+    // fall through
+  }
+
+  // 2) Escaped or raw JSON fields inside page payloads (jina HTML mode).
+  // Yahoo/jina often embed JSON with backslash-escaped quotes (\"field\").
+  const findRaw = (field) => {
+    const esc = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const patterns = [
+      // "field":{"raw":123} or \"field\":{\"raw\":123}
+      new RegExp(
+        String.raw`\\?"` +
+          esc +
+          String.raw`\\?"\s*:\s*\\?{\s*\\?"raw\\?"\s*:\s*([+-]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)`
+      ),
+      new RegExp(
+        String.raw`\\?"` +
+          esc +
+          String.raw`\\?"\s*:\s*([+-]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)`
+      ),
+    ];
+    for (const re of patterns) {
+      const m = html.match(re);
+      if (m) {
+        const v = Number(m[1]);
+        if (Number.isFinite(v)) return v;
+      }
+    }
+    return null;
+  };
+  const findKey = (field) => {
+    const esc = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const m = html.match(
+      new RegExp(
+        String.raw`\\?"` +
+          esc +
+          String.raw`\\?"\s*:\s*\\?"([a-zA-Z_]+)\\?"`
+      )
+    );
+    return m ? m[1] : null;
+  };
+
+  let forwardPE = findRaw("forwardPE");
+  let recommendation = formatRecommendation(findKey("recommendationKey"));
+  let targetPrice = findRaw("targetMeanPrice");
+
+  // 3) Visible fallbacks (markdown / partial HTML)
+  if (targetPrice == null) {
+    const m =
+      html.match(/1y Target Est\s*([0-9]+(?:\.[0-9]+)?)/i) ||
+      html.match(
+        /data-field="targetMeanPrice"[^>]*data-value="([0-9.]+)"|data-value="([0-9.]+)"[^>]*data-field="targetMeanPrice"/i
+      );
+    if (m) {
+      const v = Number(m[1] || m[2]);
+      if (Number.isFinite(v)) targetPrice = v;
+    }
+  }
+
+  return { forwardPE, recommendation, targetPrice };
+}
+
+function mergeFundamentals(a, b) {
+  return {
+    forwardPE: a.forwardPE != null ? a.forwardPE : b.forwardPE,
+    recommendation: a.recommendation || b.recommendation,
+    targetPrice: a.targetPrice != null ? a.targetPrice : b.targetPrice,
+  };
+}
+
 async function fetchFundamentals(symbol) {
   const empty = { forwardPE: null, recommendation: null, targetPrice: null };
-  const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(
-    symbol
-  )}?modules=defaultKeyStatistics,financialData`;
+  const sym = encodeURIComponent(symbol);
   try {
-    const json = await fetchJson(url, { attempts: 1 });
-    const result = json?.quoteSummary?.result?.[0];
-    if (!result) return empty;
-    return {
-      forwardPE: num(result.defaultKeyStatistics?.forwardPE),
-      recommendation: formatRecommendation(
-        result.financialData?.recommendationKey ?? null
-      ),
-      targetPrice: num(result.financialData?.targetMeanPrice),
-    };
+    const quoteHtml = await fetchYahooHtml(
+      `https://finance.yahoo.com/quote/${sym}/`,
+      { attempts: 2 }
+    );
+    let result = parseFundamentalsFromHtml(quoteHtml);
+
+    const incomplete =
+      result.forwardPE == null ||
+      !result.recommendation ||
+      result.targetPrice == null;
+    if (incomplete) {
+      try {
+        const analysisHtml = await fetchYahooHtml(
+          `https://finance.yahoo.com/quote/${sym}/analysis/`,
+          { attempts: 2 }
+        );
+        result = mergeFundamentals(
+          result,
+          parseFundamentalsFromHtml(analysisHtml)
+        );
+      } catch {
+        // keep quote-page partials
+      }
+    }
+    return result;
   } catch {
     return empty;
   }
@@ -712,7 +933,8 @@ async function loadAll() {
   // News / fundamentals after charts, one at a time
   await mapPool(enrichQueue, ENRICH_CONCURRENCY, async (symbol) => {
     await enrichOne(symbol);
-    await sleep(350);
+    // Fundamentals use jina HTML (~20 req/min); keep spacing generous
+    await sleep(900);
   });
   updateHeader();
 }
