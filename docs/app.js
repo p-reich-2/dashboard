@@ -2,7 +2,13 @@ import { TICKERS, TICKER_ALIASES } from "./tickers.js";
 
 const NEWS_MAX_AGE_MS = 48 * 60 * 60 * 1000;
 const NEWS_FETCH_COUNT = 12;
-const CORS_PROXY = "https://api.allorigins.win/raw?url=";
+const FETCH_TIMEOUT_MS = 28000;
+const MAX_ATTEMPTS = 3;
+const CHART_CONCURRENCY = 2;
+const ENRICH_CONCURRENCY = 1;
+const RETRY_BASE_MS = 700;
+
+/** @typedef {{ loading: boolean, error: string|null, data: object|null, enriching?: boolean }} TileState */
 
 const AMBIGUOUS_TICKERS = new Set([
   "NOW",
@@ -27,7 +33,7 @@ const lastUpdatedEl = document.getElementById("last-updated");
 const loadingCountEl = document.getElementById("loading-count");
 const refreshBtn = document.getElementById("refresh-btn");
 
-/** @type {Record<string, { loading: boolean, error: string|null, data: object|null }>} */
+/** @type {Record<string, TileState>} */
 const tiles = {};
 
 function escapeHtml(s) {
@@ -95,35 +101,145 @@ function formatRecommendation(key) {
   return map[k] ?? String(key).replace(/_/g, " ");
 }
 
-async function fetchJson(url) {
-  const tryOnce = async (u) => {
-    const res = await fetch(u, {
-      cache: "no-store",
-      headers: { Accept: "application/json" },
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const text = await res.text();
-    try {
-      return JSON.parse(text);
-    } catch {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Run async tasks with a fixed concurrency limit.
+ * @template T
+ * @param {T[]} items
+ * @param {number} limit
+ * @param {(item: T) => Promise<void>} worker
+ */
+async function mapPool(items, limit, worker) {
+  const queue = items.slice();
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (queue.length) {
+      const item = queue.shift();
+      if (item === undefined) return;
+      await worker(item);
+    }
+  });
+  await Promise.all(runners);
+}
+
+/**
+ * @param {string} text
+ * @returns {any}
+ */
+function parseJsonPayload(text) {
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed) throw new Error("Empty response");
+
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    // jina markdown / surrounding text: pull first JSON object
+    const start = trimmed.indexOf("{");
+    const end = trimmed.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      parsed = JSON.parse(trimmed.slice(start, end + 1));
+    } else {
       throw new Error("Invalid JSON");
     }
-  };
+  }
 
-  try {
-    return await tryOnce(url);
-  } catch (directErr) {
-    const proxied = CORS_PROXY + encodeURIComponent(url);
-    try {
-      return await tryOnce(proxied);
-    } catch (proxyErr) {
-      const msg =
-        proxyErr instanceof Error ? proxyErr.message : "Proxy fetch failed";
-      const direct =
-        directErr instanceof Error ? directErr.message : "Direct fetch failed";
-      throw new Error(`${direct}; proxy: ${msg}`);
+  if (parsed && typeof parsed === "object") {
+    if ("chart" in parsed || "news" in parsed || "quoteSummary" in parsed) {
+      return parsed;
+    }
+    // allorigins /get
+    if (typeof parsed.contents === "string") {
+      if (!parsed.contents.trim()) throw new Error("Proxy empty contents");
+      return JSON.parse(parsed.contents);
+    }
+    // jina reader JSON API
+    if (parsed.data && typeof parsed.data.content === "string") {
+      const content = parsed.data.content.trim();
+      if (!content) throw new Error("Jina empty content");
+      return JSON.parse(content);
+    }
+    if (typeof parsed.content === "string" && parsed.content.trim().startsWith("{")) {
+      return JSON.parse(parsed.content);
     }
   }
+  return parsed;
+}
+
+/**
+ * Build candidate URLs: direct Yahoo first, then CORS proxies.
+ * @param {string} yahooUrl
+ * @returns {string[]}
+ */
+function proxyCandidates(yahooUrl) {
+  const enc = encodeURIComponent(yahooUrl);
+  return [
+    yahooUrl,
+    `https://r.jina.ai/${yahooUrl}`,
+    `https://api.allorigins.win/get?url=${enc}`,
+    `https://api.allorigins.win/raw?url=${enc}`,
+    `https://api.codetabs.com/v1/proxy?quest=${enc}`,
+  ];
+}
+
+/**
+ * Fetch JSON from Yahoo via direct + proxy fallbacks, with timeout and retries.
+ * @param {string} yahooUrl
+ * @param {{ attempts?: number }} [opts]
+ */
+async function fetchJson(yahooUrl, opts = {}) {
+  const attempts = opts.attempts ?? MAX_ATTEMPTS;
+  const candidates = proxyCandidates(yahooUrl);
+  const errors = [];
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    // Rotate start index so retries try a different order after failures
+    const order = candidates
+      .slice(attempt % candidates.length)
+      .concat(candidates.slice(0, attempt % candidates.length));
+
+    for (const url of order) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+      try {
+        const res = await fetch(url, {
+          cache: "no-store",
+          signal: controller.signal,
+          headers: { Accept: "application/json" },
+        });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const text = await res.text();
+        if (!text || !text.trim()) throw new Error("Empty body");
+        return parseJsonPayload(text);
+      } catch (err) {
+        const msg =
+          err?.name === "AbortError"
+            ? "timeout"
+            : err instanceof Error
+              ? err.message
+              : String(err);
+        const host = (() => {
+          try {
+            return new URL(url).hostname;
+          } catch {
+            return "fetch";
+          }
+        })();
+        errors.push(`${host}: ${msg}`);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    if (attempt < attempts - 1) {
+      await sleep(RETRY_BASE_MS * Math.pow(2, attempt) + Math.random() * 400);
+    }
+  }
+
+  throw new Error(errors.slice(-4).join(" · ") || "All fetch strategies failed");
 }
 
 function pickPrice(meta) {
@@ -167,11 +283,12 @@ async function fetchChart(symbol) {
     (c) => typeof c === "number" && Number.isFinite(c)
   );
 
+  // Optional intraday meta for pre/post labels — never fail the tile
   try {
     const dayUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
       symbol
     )}?range=1d&interval=5m&includePrePost=true`;
-    const dayJson = await fetchJson(dayUrl);
+    const dayJson = await fetchJson(dayUrl, { attempts: 1 });
     const dayMeta = dayJson?.chart?.result?.[0]?.meta;
     if (dayMeta) result.meta = { ...result.meta, ...dayMeta };
   } catch {
@@ -263,7 +380,7 @@ async function fetchNewsCandidates(symbol) {
   const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(
     symbol
   )}&newsCount=${NEWS_FETCH_COUNT}&quotesCount=0`;
-  const json = await fetchJson(url);
+  const json = await fetchJson(url, { attempts: 2 });
   return json.news ?? [];
 }
 
@@ -282,7 +399,7 @@ async function fetchFundamentals(symbol) {
     symbol
   )}?modules=defaultKeyStatistics,financialData`;
   try {
-    const json = await fetchJson(url);
+    const json = await fetchJson(url, { attempts: 1 });
     const result = json?.quoteSummary?.result?.[0];
     if (!result) return empty;
     return {
@@ -297,29 +414,45 @@ async function fetchFundamentals(symbol) {
   }
 }
 
-async function fetchStockData(symbol) {
+/**
+ * Critical path: chart only. News/fundamentals enrich later.
+ * @param {string} symbol
+ */
+async function fetchChartData(symbol) {
   const sym = symbol.trim().toUpperCase();
-  const [chartSettled, newsSettled, fundSettled] = await Promise.allSettled([
-    fetchChart(sym),
+  const { meta, sparkline } = await fetchChart(sym);
+  const { price, label } = pickPrice(meta);
+  const companyName = meta.shortName || meta.longName || null;
+  return {
+    symbol: sym,
+    name: companyName,
+    price,
+    priceLabel: label,
+    changePercent: num(meta.regularMarketChangePercent),
+    forwardPE: null,
+    recommendation: null,
+    targetPrice: null,
+    newsTitle: null,
+    newsUrl: null,
+    sparkline,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Optional enrichment — never throws to caller.
+ * @param {object} data
+ */
+async function enrichStockData(data) {
+  const sym = data.symbol;
+  const [newsSettled, fundSettled] = await Promise.allSettled([
     fetchNewsCandidates(sym),
     fetchFundamentals(sym),
   ]);
 
-  if (chartSettled.status === "rejected") {
-    throw new Error(
-      chartSettled.reason instanceof Error
-        ? chartSettled.reason.message
-        : `Failed to load ${sym}`
-    );
-  }
-
-  const { meta, sparkline } = chartSettled.value;
-  const { price, label } = pickPrice(meta);
-  const companyName = meta.shortName || meta.longName || null;
-
   const news =
     newsSettled.status === "fulfilled"
-      ? pickRelevantNews(newsSettled.value, sym, companyName)
+      ? pickRelevantNews(newsSettled.value, sym, data.name)
       : { title: null, url: null };
   const funds =
     fundSettled.status === "fulfilled"
@@ -327,17 +460,12 @@ async function fetchStockData(symbol) {
       : { forwardPE: null, recommendation: null, targetPrice: null };
 
   return {
-    symbol: sym,
-    name: companyName,
-    price,
-    priceLabel: label,
-    changePercent: num(meta.regularMarketChangePercent),
+    ...data,
     forwardPE: funds.forwardPE,
     recommendation: funds.recommendation,
     targetPrice: funds.targetPrice,
     newsTitle: news.title,
     newsUrl: news.url,
-    sparkline,
     fetchedAt: new Date().toISOString(),
   };
 }
@@ -390,6 +518,9 @@ function renderError(symbol, error) {
     <h2 class="symbol">${escapeHtml(symbol)}</h2>
     <p class="error-msg">Failed to load</p>
     <p class="error-detail">${escapeHtml(error || "Unknown error")}</p>
+    <button type="button" class="retry-btn" data-retry="${escapeHtml(
+      symbol
+    )}">Retry</button>
   </article>`;
 }
 
@@ -446,7 +577,9 @@ function renderTile(data) {
 }
 
 function updateHeader() {
-  const loadingCount = Object.values(tiles).filter((t) => t.loading).length;
+  const loadingCount = Object.values(tiles).filter(
+    (t) => t.loading || t.enriching
+  ).length;
   const fetchedAts = Object.values(tiles)
     .map((t) => t.data?.fetchedAt)
     .filter(Boolean)
@@ -467,7 +600,7 @@ function updateHeader() {
     loadingCountEl.textContent = "";
   }
 
-  refreshBtn.disabled = loadingCount > 0;
+  refreshBtn.disabled = Object.values(tiles).some((t) => t.loading);
 }
 
 function paintTile(symbol) {
@@ -489,35 +622,110 @@ function paintTile(symbol) {
 function initGrid() {
   gridEl.innerHTML = "";
   for (const symbol of TICKERS) {
-    tiles[symbol] = { loading: true, error: null, data: null };
+    tiles[symbol] = { loading: true, error: null, data: null, enriching: false };
     paintTile(symbol);
   }
   updateHeader();
 }
 
+async function enrichOne(symbol) {
+  const state = tiles[symbol];
+  if (!state?.data) return;
+  tiles[symbol] = { ...state, enriching: true };
+  updateHeader();
+  try {
+    const enriched = await enrichStockData(state.data);
+    // Only apply if chart data for this symbol is still current
+    if (tiles[symbol]?.data?.symbol === symbol) {
+      tiles[symbol] = {
+        loading: false,
+        error: null,
+        data: enriched,
+        enriching: false,
+      };
+      paintTile(symbol);
+    }
+  } catch {
+    if (tiles[symbol]) {
+      tiles[symbol] = { ...tiles[symbol], enriching: false };
+    }
+  }
+  updateHeader();
+}
+
+async function loadOne(symbol) {
+  tiles[symbol] = {
+    loading: true,
+    error: null,
+    data: tiles[symbol]?.data ?? null,
+    enriching: false,
+  };
+  if (!tiles[symbol].data) paintTile(symbol);
+  updateHeader();
+
+  try {
+    const data = await fetchChartData(symbol);
+    tiles[symbol] = { loading: false, error: null, data, enriching: false };
+    paintTile(symbol);
+    updateHeader();
+    // Enrich in background without failing the tile
+    enrichOne(symbol);
+  } catch (err) {
+    tiles[symbol] = {
+      loading: false,
+      error: err instanceof Error ? err.message : "Network error",
+      data: null,
+      enriching: false,
+    };
+    paintTile(symbol);
+    updateHeader();
+  }
+}
+
 async function loadAll() {
   initGrid();
-  await Promise.all(
-    TICKERS.map(async (symbol) => {
-      try {
-        const data = await fetchStockData(symbol);
-        tiles[symbol] = { loading: false, error: null, data };
-      } catch (err) {
-        tiles[symbol] = {
-          loading: false,
-          error: err instanceof Error ? err.message : "Network error",
-          data: null,
-        };
-      }
+  const enrichQueue = [];
+
+  await mapPool(TICKERS, CHART_CONCURRENCY, async (symbol) => {
+    try {
+      const data = await fetchChartData(symbol);
+      tiles[symbol] = { loading: false, error: null, data, enriching: false };
       paintTile(symbol);
       updateHeader();
-    })
-  );
+      enrichQueue.push(symbol);
+    } catch (err) {
+      tiles[symbol] = {
+        loading: false,
+        error: err instanceof Error ? err.message : "Network error",
+        data: null,
+        enriching: false,
+      };
+      paintTile(symbol);
+      updateHeader();
+    }
+    // Small gap to ease proxy rate limits
+    await sleep(250);
+  });
+
+  updateHeader();
+
+  // News / fundamentals after charts, one at a time
+  await mapPool(enrichQueue, ENRICH_CONCURRENCY, async (symbol) => {
+    await enrichOne(symbol);
+    await sleep(350);
+  });
   updateHeader();
 }
 
 refreshBtn.addEventListener("click", () => {
   loadAll();
+});
+
+gridEl.addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-retry]");
+  if (!btn) return;
+  const symbol = btn.getAttribute("data-retry");
+  if (symbol) loadOne(symbol);
 });
 
 loadAll();

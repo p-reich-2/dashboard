@@ -298,6 +298,30 @@ main {
   color: #7dd3fc;
 }
 
+
+.retry-btn {
+  appearance: none;
+  align-self: flex-start;
+  margin-top: 0.75rem;
+  border: 1px solid #52525b;
+  background: #27272a;
+  color: #e4e4e7;
+  border-radius: 0.45rem;
+  padding: 0.35rem 0.75rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.retry-btn:hover {
+  background: #3f3f46;
+  border-color: #71717a;
+}
+
+.retry-btn:active {
+  transform: scale(0.98);
+}
+
 .error-msg {
   margin: 0.75rem 0 0;
   font-size: 0.875rem;
